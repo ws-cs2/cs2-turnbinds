@@ -1,8 +1,11 @@
-﻿using System.Runtime.InteropServices;
+﻿using System.ComponentModel;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Text.Json.Serialization.Metadata;
 using cs2_turnbinds;
+using Microsoft.Win32.SafeHandles;
 
 public class Config
 {
@@ -16,6 +19,7 @@ public class Config
     public Keys Inc { get; set; }
     public Keys Dec { get; set; }
     public Keys Exit { get; set; }
+    public bool PauseWhenCursorVisible { get; set; } = true;
 }
 
 [JsonSerializable(typeof(Config))]
@@ -62,21 +66,45 @@ public class KeysConverter : JsonConverter<Keys>
 
 class Program
 {
-    [StructLayout(LayoutKind.Explicit)]
-    struct LARGE_INTEGER
+    [StructLayout(LayoutKind.Sequential)]
+    struct CursorPoint
     {
-        [FieldOffset(0)] public long QuadPart;
+        public int X;
+        public int Y;
     }
-    
-    
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct CursorInfo
+    {
+        public uint Size;
+        public uint Flags;
+        public IntPtr Cursor;
+        public CursorPoint Position;
+    }
+
     [DllImport("user32.dll")]
     static extern void mouse_event(int dwFlags, int dx, int dy, int dwData, int dwExtraInfo);
     
     [DllImport("user32.dll")]
     static extern short GetAsyncKeyState(int vKey);
+
+    [DllImport("user32.dll")]
+    static extern IntPtr GetForegroundWindow();
+
+    [DllImport("user32.dll")]
+    static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    static extern bool GetCursorInfo(ref CursorInfo cursorInfo);
     
-    [DllImport("ntdll.dll")]
-    private static extern uint NtDelayExecution([In] bool Alertable, [In] ref LARGE_INTEGER DelayInterval);
+    [DllImport("kernel32.dll", EntryPoint = "CreateWaitableTimerExW", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern SafeWaitHandle CreateWaitableTimerEx(IntPtr timerAttributes, string? timerName, uint flags, uint desiredAccess);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool SetWaitableTimer(SafeWaitHandle timer, ref long dueTime, int period, IntPtr completionRoutine, IntPtr argument, bool resume);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern uint WaitForSingleObject(SafeWaitHandle handle, uint milliseconds);
     
     [DllImport("kernel32.dll")]
     private static extern bool QueryPerformanceCounter(out long lpPerformanceCount);
@@ -92,20 +120,128 @@ class Program
     const int MOUSEEVENTF_ABSOLUTE = 0x8000;
     const int SM_CXSCREEN = 0;
     const int SM_CYSCREEN = 1;
-    
-    static void MoveMouse(int deltaX, int deltaY)
+    const uint CURSOR_SHOWING = 0x00000001;
+
+    static Process? foregroundProcess;
+    static uint foregroundProcessId;
+
+    static bool IsCs2Foreground()
     {
-        mouse_event(MOUSEEVENTF_MOVE, deltaX, deltaY, 0, (int)IntPtr.Zero);
+        var window = GetForegroundWindow();
+        GetWindowThreadProcessId(window, out var processId);
+
+        try
+        {
+            if (processId != foregroundProcessId || foregroundProcess == null)
+            {
+                foregroundProcess?.Dispose();
+                foregroundProcess = null;
+                foregroundProcessId = 0;
+
+                if (window == IntPtr.Zero || processId == 0)
+                {
+                    return false;
+                }
+
+                foregroundProcess = Process.GetProcessById(checked((int)processId));
+                foregroundProcessId = processId;
+            }
+
+            return !foregroundProcess.HasExited &&
+                string.Equals(foregroundProcess.ProcessName, "cs2", StringComparison.OrdinalIgnoreCase);
+        }
+        catch (Exception exception) when (exception is ArgumentException or InvalidOperationException or Win32Exception or OverflowException)
+        {
+            foregroundProcess?.Dispose();
+            foregroundProcess = null;
+            foregroundProcessId = 0;
+            return false;
+        }
     }
     
-    static void DelayExecutionBy(long hns)
+    static bool IsCursorHidden()
     {
-        // Convert the delay from 100-nanosecond intervals to a LARGE_INTEGER
-        LARGE_INTEGER interval;
-        interval.QuadPart = -1 * hns; // Negative value for relative delay
+        var cursorInfo = new CursorInfo { Size = (uint)Marshal.SizeOf<CursorInfo>() };
+        return GetCursorInfo(ref cursorInfo) && (cursorInfo.Flags & CURSOR_SHOWING) == 0;
+    }
 
-        // Call NtDelayExecution
-        NtDelayExecution(false, ref interval);
+    static bool IsGameplayInputAllowed(Config config)
+    {
+        return IsCs2Foreground() && (!config.PauseWhenCursorVisible || IsCursorHidden());
+    }
+
+    static void MoveMouse(int deltaX, int deltaY, Config config)
+    {
+        if ((deltaX != 0 || deltaY != 0) && IsGameplayInputAllowed(config))
+        {
+            mouse_event(MOUSEEVENTF_MOVE, deltaX, deltaY, 0, (int)IntPtr.Zero);
+        }
+    }
+
+    sealed class MovementTimer : IDisposable
+    {
+        private const uint CREATE_WAITABLE_TIMER_HIGH_RESOLUTION = 0x00000002;
+        private const uint TIMER_MODIFY_STATE = 0x00000002;
+        private const uint SYNCHRONIZE = 0x00100000;
+        private readonly SafeWaitHandle timer;
+        private readonly long interval = Math.Max(1, Stopwatch.Frequency / 1000);
+        private long nextTick;
+
+        public MovementTimer()
+        {
+            timer = CreateWaitableTimerEx(IntPtr.Zero, null, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_MODIFY_STATE | SYNCHRONIZE);
+            if (timer.IsInvalid)
+            {
+                var error = Marshal.GetLastWin32Error();
+                timer.Dispose();
+                throw new Win32Exception(error, "Unable to create a high-resolution movement timer. Windows 10 version 1803 or newer is required.");
+            }
+
+            nextTick = Stopwatch.GetTimestamp() + interval;
+        }
+
+        public void WaitNextTick()
+        {
+            var now = Stopwatch.GetTimestamp();
+            var remaining = nextTick - now;
+            if (remaining > 0)
+            {
+                long dueTime = -Math.Max(1, remaining * 10_000_000 / Stopwatch.Frequency);
+                if (!SetWaitableTimer(timer, ref dueTime, 0, IntPtr.Zero, IntPtr.Zero, false) ||
+                    WaitForSingleObject(timer, uint.MaxValue) != 0)
+                {
+                    throw new Win32Exception(Marshal.GetLastWin32Error(), "Unable to wait for the movement timer.");
+                }
+            }
+
+            now = Stopwatch.GetTimestamp();
+            nextTick += interval;
+            if (nextTick <= now)
+            {
+                nextTick = now + interval;
+            }
+        }
+
+        public void Dispose()
+        {
+            timer.Dispose();
+        }
+    }
+
+    sealed class HotkeyCooldown
+    {
+        private long nextActivation;
+
+        public bool TryActivate(long timestamp)
+        {
+            if (timestamp < nextActivation)
+            {
+                return false;
+            }
+
+            nextActivation = timestamp + Stopwatch.Frequency / 5;
+            return true;
+        }
     }
     
     public class MouseMoveCalculator
@@ -118,6 +254,12 @@ class Program
         {
             QueryPerformanceCounter(out lastTime);
             QueryPerformanceFrequency(out frequency);
+        }
+
+        public void Reset()
+        {
+            QueryPerformanceCounter(out lastTime);
+            remainingMovement = 0;
         }
 
         public int CalculateMovement(double yawspeed, double sensitivity, double m_yaw)
@@ -210,6 +352,7 @@ class Program
         Console.WriteLine("Increase Yaw: " + config.Inc);
         Console.WriteLine("Decrease Yaw: " + config.Dec);
         Console.WriteLine("Exit: " + config.Exit);
+        Console.WriteLine("Pause when cursor visible: " + config.PauseWhenCursorVisible);
         
         Console.WriteLine();
         Console.WriteLine("To edit bindings, edit config.json and restart the program.");
@@ -220,31 +363,56 @@ class Program
         Console.WriteLine();
         Console.WriteLine("Current yaw speed: " + config.Yaw[0]);
         Console.WriteLine("PAUSED, press " + config.Pause + " to unpause");
+        Console.WriteLine("Movement and gameplay hotkeys only work while CS2 is focused. Exit works globally.");
         
         int currentYawIndex = 0;
         bool paused = true;
         var calculator = new MouseMoveCalculator();
+        using var movementTimer = new MovementTimer();
+        var pauseCooldown = new HotkeyCooldown();
+        var increaseCooldown = new HotkeyCooldown();
+        var decreaseCooldown = new HotkeyCooldown();
+        var toggleCooldown = new HotkeyCooldown();
 
         while (true)
         {
-            var movement = calculator.CalculateMovement(config.Yaw[currentYawIndex],  config.Sensitivity, config.M_Yaw);
-            
-            // Check if the left mouse button is pressed and not paused
-            if (IsKeyDown((int) config.Left) && !paused)
+            movementTimer.WaitNextTick();
+
+            if (IsKeyDown((int) config.Exit))
             {
-                // Move the mouse left by the specified speed
-                MoveMouse(-movement, 0);
+                Console.WriteLine("Exiting program...");
+                break;
             }
 
-            // Check if the right mouse button is pressed and not paused
-            if (IsKeyDown((int) config.Right) && !paused)
+            if (!IsCs2Foreground())
             {
-                // Move the mouse right by the specified speed
-                MoveMouse(movement, 0);
+                calculator.Reset();
+                continue;
             }
+
+            if (IsGameplayInputAllowed(config))
+            {
+                var movement = calculator.CalculateMovement(config.Yaw[currentYawIndex],  config.Sensitivity, config.M_Yaw);
+
+                if (IsKeyDown((int) config.Left) && !paused)
+                {
+                    MoveMouse(-movement, 0, config);
+                }
+
+                if (IsKeyDown((int) config.Right) && !paused)
+                {
+                    MoveMouse(movement, 0, config);
+                }
+            }
+            else
+            {
+                calculator.Reset();
+            }
+
+            var timestamp = Stopwatch.GetTimestamp();
 
             // Check if the 'P' key is pressed to toggle pause state for left mouse button
-            if (IsKeyDown((int) config.Pause))
+            if (IsCs2Foreground() && IsKeyDown((int) config.Pause) && pauseCooldown.TryActivate(timestamp))
             {
                 paused = !paused;
                 if (paused)
@@ -255,40 +423,27 @@ class Program
                 {
                     Console.WriteLine("ACTIVE press " + config.Pause + " to pause");
                 }
-                Thread.Sleep(200); // Delay to avoid multiple toggles with one key press
             }
 
             // Check if the '+' key is pressed to increase yaw speed
-            if (IsKeyDown((int) config.Inc) && !paused)
+            if (IsGameplayInputAllowed(config) && IsKeyDown((int) config.Inc) && !paused && increaseCooldown.TryActivate(timestamp))
             {
                 config.Yaw[currentYawIndex] += 10; // Increase yaw speed by 10
-                Thread.Sleep(200); // Delay to avoid multiple increments with one key press
                 Console.WriteLine($"Yaw speed increased to {config.Yaw[currentYawIndex]}");
             }
 
             // Check if the '-' key is pressed to decrease yaw speed
-            if (IsKeyDown((int) config.Dec) && !paused)
+            if (IsGameplayInputAllowed(config) && IsKeyDown((int) config.Dec) && !paused && decreaseCooldown.TryActivate(timestamp))
             {
                 config.Yaw[currentYawIndex] -= 10; // Decrease yaw speed by 10
-                Thread.Sleep(200); // Delay to avoid multiple decrements with one key press
                 Console.WriteLine($"Yaw speed decreased to {config.Yaw[currentYawIndex]}");
             }
             
-            if (IsKeyDown((int) config.Toggle) && !paused)
+            if (IsGameplayInputAllowed(config) && IsKeyDown((int) config.Toggle) && !paused && toggleCooldown.TryActivate(timestamp))
             {
                 currentYawIndex = (currentYawIndex + 1) % config.Yaw.Count;
                 Console.WriteLine($"Yaw speed toggled to {config.Yaw[currentYawIndex]}");
-                Thread.Sleep(200); // Delay to avoid multiple toggles with one key press
             }
-
-            // Check if the END key is pressed to exit the program
-            if (IsKeyDown((int) config.Exit))
-            {
-                Console.WriteLine("Exiting program...");
-                break; // Exit the loop
-            }
-            
-            DelayExecutionBy(3500);
         }
     }
 }
